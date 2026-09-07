@@ -1,0 +1,350 @@
+import json
+import os
+import html
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+
+# --- Persistent Data Storage Setup ---
+POINTS_FILE = "xopoints.json"
+
+def load_points():
+    """Loads points and upgrades old formats automatically."""
+    if os.path.exists(POINTS_FILE):
+        with open(POINTS_FILE, "r") as file:
+            try:
+                data = json.load(file)
+                for k, v in data.items():
+                    if isinstance(v, int):
+                        data[k] = {"points": v, "name": f"User_{k}"}
+                return data
+            except json.JSONDecodeError:
+                return {}
+    return {}
+
+def save_points(points_data):
+    """Saves the current points dictionary to the JSON file."""
+    with open(POINTS_FILE, "w") as file:
+        json.dump(points_data, file, indent=4)
+
+# --- In-Memory Variables ---
+active_games = {}
+user_points = load_points()
+
+def get_player_info(user):
+    """Returns the player's Full Name, safely escaped to prevent HTML parsing crashes."""
+    return html.escape(user.full_name)
+
+def get_board_markup(board):
+    """Generates the 3x3 inline keyboard for the XO board."""
+    keyboard = []
+    for i in range(0, 9, 3):
+        row = [
+            InlineKeyboardButton(
+                board[i + j] if board[i + j] != ' ' else '⬛️', 
+                callback_data=f"xo_{i + j}"
+            ) for j in range(3)
+        ]
+        keyboard.append(row)
+    return InlineKeyboardMarkup(keyboard)
+
+def check_win(board):
+    """Checks if there is a winner on the board."""
+    win_lines = [
+        (0,1,2), (3,4,5), (6,7,8), # Horizontal
+        (0,3,6), (1,4,7), (2,5,8), # Vertical
+        (0,4,8), (2,4,6)           # Diagonal
+    ]
+    for a, b, c in win_lines:
+        if board[a] != ' ' and board[a] == board[b] == board[c]:
+            return board[a]
+    return None
+
+def safe_remove_job(job):
+    """Safely removes a scheduled job, ignoring APScheduler LookupErrors if it was already removed."""
+    if job:
+        try:
+            job.schedule_removal()
+        except Exception:
+            pass # Job is already gone, ignore the error
+
+async def live_countdown(context: ContextTypes.DEFAULT_TYPE):
+    """Updates the message every 3 seconds to show a live countdown."""
+    job = context.job
+    chat_id = job.data['chat_id']
+
+    if chat_id not in active_games:
+        safe_remove_job(job)
+        return
+
+    game = active_games[chat_id]
+    
+    # Don't interrupt the timer if someone is currently making a move
+    if game.get('is_processing'):
+        return
+
+    game['time_left'] -= 3
+
+    if game['time_left'] <= 0:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=game['message_id'],
+                text="⏳ <b>Game Closed!</b>\n\nAutomatically closed due to 60 seconds of inactivity.\n\nType /xo to start a new game.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass 
+        
+        del active_games[chat_id]
+        safe_remove_job(job)
+    else:
+        try:
+            text = f"{game['base_text']}\n\n(⏳ {game['time_left']} seconds remaining)"
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=game['message_id'],
+                text=text,
+                reply_markup=get_board_markup(game['board']),
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass 
+
+async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /xo command to start a game."""
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+
+    if chat_id in active_games:
+        await update.message.reply_text("❌ A game is already running in this group! Finish it or type /xoclose to force close it.")
+        return
+
+    player_info = get_player_info(user)
+    
+    base_text = (
+        f"🎮 <b>Tic-Tac-Toe started!</b>\n\n"
+        f"❌ Player X: {player_info}\n"
+        f"⭕️ Player O: Waiting for opponent...\n\n"
+        f"It is X's turn!"
+    )
+
+    active_games[chat_id] = {
+        'board': [' '] * 9,
+        'player_x': user,
+        'player_x_info': player_info,
+        'player_o': None,
+        'player_o_info': "Waiting for opponent...",
+        'turn': 'X',
+        'message_id': None,
+        'timer_job': None,
+        'time_left': 60,
+        'base_text': base_text,
+        'is_processing': False  # Anti-lag lock
+    }
+
+    markup = get_board_markup(active_games[chat_id]['board'])
+    message = await update.message.reply_text(
+        f"{base_text}\n\n(⏳ 60 seconds remaining)",
+        reply_markup=markup,
+        parse_mode="HTML"
+    )
+    
+    active_games[chat_id]['message_id'] = message.message_id
+
+    job = context.job_queue.run_repeating(
+        live_countdown, 
+        interval=3, 
+        first=3,
+        data={'chat_id': chat_id}
+    )
+    active_games[chat_id]['timer_job'] = job
+
+async def close_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /xoclose command to instantly shut down an active game."""
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+
+    if chat_id in active_games:
+        game = active_games[chat_id]
+        
+        # Safely remove the timer
+        safe_remove_job(game.get('timer_job'))
+            
+        closer_name = get_player_info(user)
+            
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=game['message_id'],
+                text=f"🛑 <b>Game Forcefully Closed!</b>\n\nGame has closed by {closer_name}.\n\nType /xo to start a new game.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass 
+            
+        del active_games[chat_id]
+        await update.message.reply_text(f"✅ Game has closed by <b>{closer_name}</b>.", parse_mode="HTML")
+    else:
+        await update.message.reply_text("ℹ️ There is no active game running in this group right now.", parse_mode="HTML")
+
+
+async def handle_move(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles button clicks on the XO board."""
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    data = query.data
+
+    if not data.startswith("xo_"):
+        return
+
+    if chat_id not in active_games:
+        await query.answer("This game has already ended or timed out!", show_alert=True)
+        return
+
+    game = active_games[chat_id]
+
+    # --- ANTI-LAG CHECK ---
+    if game.get('is_processing'):
+        await query.answer("⏳ Processing move, please wait...", show_alert=False)
+        return
+
+    if query.message.message_id != game['message_id']:
+        await query.answer("This is an old game board!", show_alert=True)
+        return
+
+    index = int(data.split('_')[1])
+    board = game['board']
+
+    if board[index] != ' ':
+        await query.answer("That spot is already taken!", show_alert=False)
+        return
+
+    # Turn logic
+    if game['turn'] == 'X':
+        if user.id != game['player_x'].id:
+            await query.answer("It's not your turn, or you are not Player X!", show_alert=True)
+            return
+    else:
+        if game['player_o'] is None:
+            if user.id == game['player_x'].id:
+                await query.answer("You can't play against yourself! Let someone else join.", show_alert=True)
+                return
+            game['player_o'] = user
+            game['player_o_info'] = get_player_info(user)
+        elif user.id != game['player_o'].id:
+            await query.answer("It's not your turn, or you are not Player O!", show_alert=True)
+            return
+
+    # --- LOCK THE GAME ---
+    game['is_processing'] = True
+
+    try:
+        # Safely remove the current countdown timer
+        safe_remove_job(game.get('timer_job'))
+
+        board[index] = '❌' if game['turn'] == 'X' else '⭕️'
+
+        winner_symbol = check_win(board)
+        
+        if winner_symbol:
+            winning_user = game['player_x'] if winner_symbol == '❌' else game['player_o']
+            winning_info = get_player_info(winning_user)
+            
+            user_id_str = str(winning_user.id)
+            
+            if user_id_str not in user_points:
+                user_points[user_id_str] = {"points": 0, "name": winning_info}
+                
+            user_points[user_id_str]["points"] += 10
+            user_points[user_id_str]["name"] = winning_info 
+            save_points(user_points) 
+            
+            text = f"🏆 <b>Game Over!</b>\n\nWinner: {winning_info}\nEarned <b>10 points</b>! 🎉\n\nType /xo to play again."
+            await query.edit_message_text(text=text, reply_markup=get_board_markup(board), parse_mode="HTML")
+            del active_games[chat_id]
+            
+        elif ' ' not in board:
+            text = "🤝 <b>Game Over!</b>\n\nIt's a draw! Nobody gets points.\n\nType /xo to play again."
+            await query.edit_message_text(text=text, reply_markup=get_board_markup(board), parse_mode="HTML")
+            del active_games[chat_id]
+            
+        else:
+            game['turn'] = 'O' if game['turn'] == 'X' else 'X'
+            
+            game['base_text'] = (
+                f"🎮 <b>Tic-Tac-Toe</b>\n\n"
+                f"❌ Player X: {game['player_x_info']}\n"
+                f"⭕️ Player O: {game['player_o_info']}\n\n"
+                f"It is <b>{game['turn']}</b>'s turn!"
+            )
+            
+            game['time_left'] = 60
+            
+            text = f"{game['base_text']}\n\n(⏳ 60 seconds remaining)"
+            await query.edit_message_text(text=text, reply_markup=get_board_markup(board), parse_mode="HTML")
+            
+            new_job = context.job_queue.run_repeating(
+                live_countdown, 
+                interval=3, 
+                first=3,
+                data={'chat_id': chat_id}
+            )
+            game['timer_job'] = new_job
+        
+        await query.answer()
+
+    except Exception as e:
+        print(f"Error processing move: {e}")
+        await query.answer("Network lag! Updating board...", show_alert=False)
+        
+    finally:
+        # --- UNLOCK THE GAME ---
+        if chat_id in active_games:
+            active_games[chat_id]['is_processing'] = False
+
+async def check_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays the Top 20 players and the current user's points."""
+    user = update.effective_user
+    user_id_str = str(user.id)
+    
+    user_data = user_points.get(user_id_str, {"points": 0})
+    personal_points = user_data["points"]
+
+    sorted_players = sorted(user_points.items(), key=lambda x: x[1]['points'], reverse=True)
+    top_20 = sorted_players[:20]
+
+    if not top_20:
+        await update.message.reply_text("📋 <b>Leaderboard is empty!</b> Play some games first to get ranked.", parse_mode="HTML")
+        return
+
+    text = "🏆 <b>TOP 20 XO PLAYERS</b> 🏆\n━━━━━━━━━━━━━━━━━━━━\n"
+    
+    for rank, (uid, data) in enumerate(top_20, 1):
+        if rank == 1:
+            medal = "🥇"
+        elif rank == 2:
+            medal = "🥈"
+        elif rank == 3:
+            medal = "🥉"
+        else:
+            medal = "🏅"
+            
+        text += f"{medal} <b>{data['name']}</b>: {data['points']} pts\n"
+        
+    text += "━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"👤 <b>Your Total Points:</b> {personal_points}"
+
+    await update.message.reply_text(text, parse_mode="HTML")
+
+if __name__ == '__main__':
+    # Replace with your actual bot token
+    app = Application.builder().token("8980626883:AAEL5o8WnMuQXB6pw3S_oeRKuRqEVrvHsmQ").build()
+
+    app.add_handler(CommandHandler("xo", start_game))
+    app.add_handler(CommandHandler("xoclose", close_game)) 
+    app.add_handler(CommandHandler("xopoints", check_points))
+    app.add_handler(CallbackQueryHandler(handle_move, pattern="^xo_"))
+
+    print("Bot is running with APScheduler crash protection enabled...")
+    app.run_polling()

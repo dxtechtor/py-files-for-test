@@ -1,0 +1,1 @@
+sqlite3 pharmacom.db "UPDATE users SET password='123456' WHERE role='admin';"

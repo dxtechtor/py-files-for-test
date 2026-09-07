@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Dino Arcade Pro</title>
+    <style>
+        /* Classic Dino Minimalist Aesthetic */
+        body { margin: 0; background: #f7f7f7; color: #535353; display: flex; justify-content: center; font-family: 'Courier New', Courier, monospace; overflow: hidden; touch-action: none; }
+        
+        /* Victory Screen */
+        #victory-screen { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(255, 255, 255, 0.95); z-index: 1000; text-align: center; color: #333; padding-top: 50px; overflow-y: auto; }
+        
+        /* Game World */
+        #game-container { position: relative; width: 400px; height: 600px; background: #fff; overflow: hidden; cursor: pointer; border: 2px solid #eee; box-shadow: 0px 4px 10px rgba(0,0,0,0.1); }
+        #ground { position: absolute; bottom: 120px; left: 0; width: 100%; height: 1px; background: #535353; }
+        
+        /* Progress Bar */
+        #progress-bg { position: absolute; top: 15px; left: 10%; width: 80%; height: 15px; background: #eee; border: 1px solid #535353; z-index: 20; }
+        #progress-bar { height: 100%; width: 0%; background: #535353; transition: width 0.3s; }
+        
+        /* UI & Text */
+        #ui { position: absolute; top: 40px; width: 100%; text-align: center; font-weight: bold; font-size: 14px; z-index: 20; pointer-events: none; }
+        .dialog { position: absolute; top: 100px; left: 50px; width: 260px; padding: 20px; background: #fff; color: #333; border: 1px solid #535353; z-index: 100; text-align: center; }
+        #countdown { position: absolute; top: 220px; width: 100%; text-align: center; font-size: 50px; font-weight: bold; color: #535353; z-index: 50; }
+        
+        /* Game Entities */
+        #dino { position: absolute; width: 30px; height: 30px; left: 40px; top: 450px; z-index: 10; font-size: 30px; line-height: 30px; user-select: none; transform: scaleX(-1); }
+        .obstacle { position: absolute; width: 25px; height: 30px; top: 450px; font-size: 25px; line-height: 30px; user-select: none; }
+        
+        /* Inputs & Buttons */
+        input { margin: 10px 0; width: 90%; padding: 10px; border: 1px solid #ccc; font-family: 'Courier New', Courier, monospace; text-align: center; box-sizing: border-box; }
+        button { background: #535353; color: white; border: none; padding: 12px 20px; cursor: pointer; font-family: 'Courier New', Courier, monospace; font-weight: bold; font-size: 16px; width: 100%; }
+        button:hover { background: #333; }
+    </style>
+</head>
+<body>
+
+<div id="victory-screen">
+    <h1 style="font-size: 2.5rem; margin-bottom: 10px;">🏆 VICTORY!</h1>
+    <p style="font-size: 1.1rem;">The Global Goal has been reached.</p>
+    <div style="margin: 20px auto; border: 2px dashed #535353; padding: 15px; display: inline-block; min-width: 250px;">
+        <h2 style="margin-top: 0;">Admins Revealed:</h2>
+        <div id="admin-list-container"></div>
+    </div>
+    <div style="margin: 10px auto; width: 80%; max-width: 350px; text-align: left;">
+        <h3 style="text-align: center;">Final Leaderboard</h3>
+        <div id="final-leaderboard" style="border: 1px solid #ccc; padding: 15px; max-height: 200px; overflow-y: auto;"></div>
+    </div>
+</div>
+
+<div id="game-container" 
+     onmousedown="startJump(event)" ontouchstart="startJump(event)" 
+     onmouseup="endJump(event)" ontouchend="endJump(event)">
+    <div id="progress-bg"><div id="progress-bar"></div></div>
+    <div id="ui">
+        HI <span id="global-meter">0</span> / <span id="limit-text">15000</span> &nbsp;&nbsp; 
+        SCORE <span id="my-score">0</span>
+    </div>
+    <div id="countdown"></div>
+    
+    <div id="dino">🦖</div>
+    <div id="ground"></div>
+</div>
+
+<div id="settings-dialog" class="dialog">
+    <h2 style="margin-top: 0;">T-REX RUN</h2>
+    <input type="text" id="username" placeholder="Enter Telegram Name"><br>
+    <button onclick="startCountdown()">START</button>
+    
+    <div id="leaderboard-preview" style="margin-top: 20px; font-size: 14px; text-align: left; border-top: 1px dashed #ccc; padding-top: 15px;">
+        <strong>Top 10 Players:</strong>
+        <div id="lb-content" style="margin-top: 10px; line-height: 1.5;">Loading...</div>
+    </div>
+</div>
+
+<script>
+    let GOAL_LIMIT = 15000;
+    document.getElementById('limit-text').innerText = GOAL_LIMIT;
+
+    // Game variables
+    let groundY = 450; 
+    let y = groundY;
+    let vy = 0, score = 0, gameStarted = false, gameOver = false, isJumping = false, finalName = "";
+    
+    // UPDATED PHYSICS:
+    // Gravity is lower (slower fall), Jump force is higher (bigger arc)
+    let g = 0.40;    
+    let j = 10.5;    
+    let s = 1.5;     
+    
+    let obstacles = [];
+    const dino = document.getElementById('dino');
+
+    async function init() {
+        try {
+            const res = await fetch('/get_game_state');
+            const data = await res.json();
+            
+            GOAL_LIMIT = data.goal_limit;
+            document.getElementById('limit-text').innerText = GOAL_LIMIT;
+            
+            document.getElementById('global-meter').innerText = data.total;
+            document.getElementById('progress-bar').style.width = Math.min((data.total/GOAL_LIMIT)*100, 100) + '%';
+            
+            const lbRes = await fetch('/get_leaderboard');
+            const lbData = await lbRes.json();
+            document.getElementById('lb-content').innerHTML = lbData.map((p, i) => `${i+1}. ${p.name} - ${p.score}`).join('<br>');
+            
+            if (data.revealed) {
+                document.getElementById('game-container').style.display = 'none';
+                document.getElementById('settings-dialog').style.display = 'none';
+                document.getElementById('victory-screen').style.display = 'block';
+                
+                const container = document.getElementById('admin-list-container');
+                container.innerHTML = data.admins.map(admin => {
+                    const handle = admin.replace('@', '');
+                    return `<a href="https://t.me/${handle}" style="text-decoration:none; display:block; margin: 10px 0; color: #333; font-weight: bold; border: 1px solid #333; padding: 8px;">${admin}</a>`;
+                }).join('');
+                
+                document.getElementById('final-leaderboard').innerHTML = lbData.map((p, i) => 
+                    `<div style="display:flex; justify-content:space-between; padding: 5px 0; border-bottom: 1px dashed #ccc;">
+                        <span>${i+1}. ${p.name}</span> <span>${p.score}</span>
+                    </div>`).join('');
+            }
+        } catch(e) { console.error("Init Error:", e); }
+    }
+    init();
+
+    function startCountdown() {
+        let nameInput = document.getElementById('username').value;
+        if(!nameInput) return alert("Please enter your name!");
+        finalName = nameInput;
+        
+        document.getElementById('settings-dialog').style.display = 'none';
+        
+        let count = 1;
+        let cDisp = document.getElementById('countdown');
+        cDisp.innerText = count; 
+        
+        let timer = setInterval(() => {
+            count--;
+            cDisp.innerText = count > 0 ? count : "GO!";
+            if(count < 0) { 
+                cDisp.innerText = ""; 
+                clearInterval(timer); 
+                gameStarted = true; 
+                loop(); 
+                // Give them a slightly longer delay before the very first cactus
+                setTimeout(scheduleObstacle, 1000);
+            }
+        }, 1000);
+    }
+
+    function scheduleObstacle() {
+        if (!gameStarted || gameOver) return;
+        createObstacle();
+        
+        let baseGap = 2000 - (s * 100); 
+        if (baseGap < 900) baseGap = 900; 
+        let nextSpawnTime = Math.random() * 1500 + baseGap; 
+        
+        setTimeout(scheduleObstacle, nextSpawnTime);
+    }
+
+    function createObstacle() {
+        let obs = document.createElement('div');
+        obs.className = 'obstacle';
+        obs.innerText = '🌵';
+        obs.style.left = '400px';
+        obs.passed = false;
+        document.getElementById('game-container').appendChild(obs);
+        obstacles.push(obs);
+    }
+
+    function loop() {
+        if (!gameStarted || gameOver) return;
+        
+        s += 0.0005; 
+        
+        vy += g; 
+        y += vy;
+        
+        if (y >= groundY) {
+            y = groundY;
+            vy = 0;
+            isJumping = false;
+        }
+        dino.style.top = y + 'px';
+
+        obstacles.forEach(o => {
+            let currentX = parseFloat(o.style.left);
+            o.style.left = (currentX - s) + 'px';
+            
+            let dRect = dino.getBoundingClientRect();
+            let oRect = o.getBoundingClientRect();
+            
+            // Forgiving hitbox logic so you don't crash unfairly
+            if (dRect.right - 12 > oRect.left && 
+                dRect.left + 12 < oRect.right && 
+                dRect.bottom - 12 > oRect.top && 
+                dRect.top + 10 < oRect.bottom) {
+                endGame();
+            }
+            
+            if (currentX < 40 && !o.passed) { 
+                o.passed = true;
+                score += 10; 
+                syncScore(10); 
+            }
+            
+            if (currentX < -50) { 
+                o.remove(); 
+                obstacles = obstacles.filter(x => x !== o); 
+            }
+        });
+        
+        requestAnimationFrame(loop);
+    }
+
+    // TRIGGERED ON CLICK DOWN
+    function startJump(e) {
+        if (e) e.preventDefault(); 
+        
+        if (!isJumping && gameStarted && !gameOver) {
+            vy = -j;
+            isJumping = true;
+        }
+    }
+
+    // TRIGGERED ON CLICK RELEASE
+    function endJump(e) {
+        if (e) e.preventDefault(); 
+        
+        // If the user lets go of the screen while the dino is still moving upwards, 
+        // immediately kill 60% of the upward velocity to make him drop faster (small jump)
+        if (isJumping && vy < 0) {
+            vy *= 0.4;
+        }
+    }
+
+    function endGame() {
+        gameOver = true;
+        dino.style.transform = "scaleX(1)";
+        dino.innerText = '💥'; 
+        setTimeout(() => {
+            alert("GAME OVER\nScore: " + score);
+            location.reload();
+        }, 50);
+    }
+
+    async function syncScore(pts = 0) {
+        try {
+            const res = await fetch('/submit_score', { 
+                method: 'POST', 
+                body: JSON.stringify({name: finalName, score: pts}), 
+                headers: {'Content-Type': 'application/json'} 
+            });
+            const data = await res.json();
+            
+            GOAL_LIMIT = data.goal_limit;
+            document.getElementById('limit-text').innerText = GOAL_LIMIT;
+            
+            document.getElementById('global-meter').innerText = data.total;
+            document.getElementById('progress-bar').style.width = Math.min((data.total/GOAL_LIMIT)*100, 100) + '%';
+            document.getElementById('my-score').innerText = score;
+            
+            if (data.revealed) {
+                gameOver = true;
+                alert("CONGRATULATIONS! Goal Reached! Admins Revealed!");
+                location.reload();
+            }
+        } catch(e) { console.error("Sync Error:", e); }
+    }
+</script>
+</body>
+</html>

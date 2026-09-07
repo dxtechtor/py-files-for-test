@@ -1,0 +1,147 @@
+import telebot
+import subprocess
+import os
+import html
+import shlex
+
+# CONFIGURATION
+TOKEN = "8999504703:AAF4P4HK_NmxXuNZeHTGPWJn2IOx8imKZQU"
+OWNER_ID = 8626582205
+VENV_PATH = "home/dx3/myenv/bin/activate"
+BOT_DIR = "home/dx3"
+
+bot = telebot.TeleBot(TOKEN)
+
+# SECURITY
+def is_owner(user_id):
+    return user_id == OWNER_ID
+
+def run_cmd(cmd):
+    """Executes system command and returns output"""
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        return result.stdout if result.stdout else result.stderr
+    except Exception as e:
+        return str(e)
+
+# --- COMMANDS ---
+
+@bot.message_handler(commands=['start'])
+def start(message):
+    if not is_owner(message.from_user.id): return
+    help_text = """
+<b>🤖 MANAGER BOT CONTROL PANEL</b>
+<b>🚀 STARTING</b>
+ 1�7 /start_bot <code>&lt;session&gt;</code> <code>&lt;script&gt;</code>
+<b>🛑 STOPPING</b>
+ 1�7 /stop_bot <code>&lt;session_OR_pid&gt;</code>
+ 1�7 /stop_all
+<b>🔍 MONITORING</b>
+ 1�7 /list, /status
+<b>📂 FILE MGMT</b>
+ 1�7 /read <code>&lt;path&gt;</code>
+ 1�7 Reply to file with /upload <code>&lt;path&gt;</code>
+<b>💻 TERMINAL</b>
+ 1�7 /cmd <code>&lt;command&gt;</code>
+"""
+    bot.reply_to(message, help_text, parse_mode="HTML")
+
+@bot.message_handler(commands=['start_bot'])
+def start_bot(message):
+    if not is_owner(message.from_user.id): return
+    args = message.text.split()
+    if len(args) != 3:
+        bot.reply_to(message, "Usage: /start_bot <session_name> <script_name>")
+        return
+    session, script = args[1], args[2]
+    cmd = f"tmux new-session -d -s {session} 'source {VENV_PATH} && cd {BOT_DIR} && python3 {script}'"
+    run_cmd(cmd)
+    bot.reply_to(message, f"🚀 Attempted to start {session}")
+
+@bot.message_handler(commands=['cmd'])
+def terminal_gateway(message):
+    if not is_owner(message.from_user.id): return
+    command = message.text.replace("/cmd", "").strip()
+    if not command: return
+    output = run_cmd(command)
+    bot.reply_to(message, f"🖥︄1�7 <b>Cmd:</b> <code>{command}</code>\n<pre>{html.escape(output[:4000])}</pre>", parse_mode="HTML")
+
+@bot.message_handler(commands=['read'])
+def read_file(message):
+    if not is_owner(message.from_user.id): return
+    args = message.text.split()
+    if len(args) != 2: return
+    filepath = args[1]
+    if os.path.exists(filepath):
+        with open(filepath, 'r') as f:
+            content = f.read()
+        bot.reply_to(message, f"📄 <b>{filepath}</b>:\n<pre>{html.escape(content[:4000])}</pre>", parse_mode="HTML")
+    else:
+        bot.reply_to(message, "❄1�7 File not found.")
+
+@bot.message_handler(commands=['upload'])
+def handle_upload(message):
+    if not is_owner(message.from_user.id): return
+    if not message.reply_to_message or not message.reply_to_message.document:
+        bot.reply_to(message, "⚠️ Reply to a file with /upload <path>")
+        return
+    args = message.text.split()
+    if len(args) != 2: return
+    dest_path = args[1].replace("$HOME", "$HOME")
+    try:
+        file_info = bot.get_file(message.reply_to_message.document.file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        with open(dest_path, 'wb') as f:
+            f.write(downloaded_file)
+        bot.reply_to(message, f"✄1�7 Uploaded to: <code>{dest_path}</code>", parse_mode="HTML")
+    except Exception as e:
+        bot.reply_to(message, f"❄1�7 Error: {str(e)}")
+
+@bot.message_handler(commands=['list'])
+def list_bots(message):
+    if not is_owner(message.from_user.id): return
+    out = run_cmd("tmux ls")
+    bot.reply_to(message, f"📋 <b>Running Sessions:</b>\n<pre>{html.escape(out)}</pre>", parse_mode="HTML")
+
+@bot.message_handler(commands=['status'])
+def status(message):
+    if not is_owner(message.from_user.id): return
+    cmd = "ps -ef | grep 'python3' | grep -v 'grep' | grep -v 'networkd-dispatcher' | grep -v 'unattended-upgrade'"
+    raw_output = run_cmd(cmd)
+    lines = raw_output.strip().split('\n')
+    response = "🔍 <b>ACTIVE PROCESSES:</b>\n\n"
+    seen = set()
+    for line in lines:
+        parts = line.split()
+        if len(parts) > 7:
+            pid = parts[1]
+            cmd_full = html.escape(" ".join(parts[7:]).replace("python3", "").strip())
+            if cmd_full not in seen:
+                response += f"🔹 <code>{cmd_full}</code> (PID: <code>{pid}</code>)\n"
+                seen.add(cmd_full)
+    bot.reply_to(message, response, parse_mode="HTML")
+
+@bot.message_handler(commands=['stop_bot'])
+def stop_bot(message):
+    if not is_owner(message.from_user.id): return
+    args = message.text.split()
+    if len(args) != 2: return
+    target = args[1]
+    if target.isdigit():
+        run_cmd(f"kill -9 {target}")
+        bot.reply_to(message, f"🛑 Killed PID {target}")
+    else:
+        run_cmd(f"tmux kill-session -t {target}")
+        run_cmd(f"pkill -f {target}.py")
+        bot.reply_to(message, f"🛑 Stopped session {target}")
+
+@bot.message_handler(commands=['stop_all'])
+def stop_all(message):
+    if not is_owner(message.from_user.id): return
+    run_cmd("tmux kill-server")
+    run_cmd("ps aux | grep 'python3' | grep -v 'manager_bot.py' | awk '{print $2}' | xargs kill -9")
+    bot.reply_to(message, "💣 <b>All other sessions terminated.</b>", parse_mode="HTML")
+
+if __name__ == "__main__":
+    bot.infinity_polling()

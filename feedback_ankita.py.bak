@@ -1,0 +1,117 @@
+import telebot
+import json
+import threading
+import os
+import time
+from datetime import datetime, timedelta
+
+# Configuration
+TOKEN = "8986686150:AAEX74y1AbCg-H0kcgIFYzHzke-q6o-JaYE"
+FREE_GROUP_ID = -1003923415143 # Your free group ID
+FEEDBACK_DB_PATH = "/home/dx2/bot_data_ankita/pending_feedback.json"
+ADMIN_ID = 1497181461
+bot = telebot.TeleBot(TOKEN)
+
+def load_json(file_path, default=None):
+    if default is None:
+        default = {}
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, 'r') as f:
+                return json.load(f)
+        except:
+            return default
+    return default
+
+def save_json(file_path, data):
+    with open(file_path, 'w') as f:
+        json.dump(data, f, indent=2, default=str)
+        
+    
+def check_auto_approval():
+    while True:
+        data = load_json(FEEDBACK_DB_PATH, {})
+        now = datetime.now()
+        for uid, info in list(data.items()):
+            if now - datetime.fromisoformat(info['time']) > timedelta(seconds=300):
+                msg_id = info.get('group_msg_id')
+                
+                # 1. Edit group message
+                try: bot.edit_message_text(f"✅ <b>USER:</b> {uid}\nStatus: <b>Auto-approved</b>", FREE_GROUP_ID, msg_id, parse_mode="HTML")
+                except: pass
+                
+                # 2. DM user
+                try: bot.send_message(uid, "✅ Your attack feedback was auto-approved. You can now attack!")
+                except: pass
+                
+                del data[uid]
+                save_json(FEEDBACK_DB_PATH, data)
+        time.sleep(30)
+
+@bot.message_handler(content_types=['photo'])
+def handle_screenshot(message):
+    if message.chat.id != FREE_GROUP_ID: return
+    
+    user_id = message.from_user.id
+    username = message.from_user.username or message.from_user.first_name
+    
+    # 1. Notify the group immediately that the user is waiting
+    status_msg = bot.send_message(
+        FREE_GROUP_ID, 
+        f"⏳ <b>USER:</b> @{username} ({user_id})\nStatus: <b>Waiting for approval...</b>", 
+        parse_mode="HTML"
+    )
+    
+    # 2. Save the message ID in the JSON so we can edit it later
+    data = load_json(FEEDBACK_DB_PATH, {})
+    data[str(user_id)] = {
+        "username": username,
+        "time": datetime.now().isoformat(),
+        "group_msg_id": status_msg.message_id # Save this ID to edit later
+    }
+    save_json(FEEDBACK_DB_PATH, data)
+    
+    # 3. Send screenshot to Admin DM
+    bot.send_photo(ADMIN_ID, message.photo[-1].file_id, 
+                   caption=f"Verify Feedback for @{username} ({user_id})",
+                   reply_markup=create_approval_markup(user_id, status_msg.message_id))
+
+def create_approval_markup(user_id, msg_id):
+    markup = telebot.types.InlineKeyboardMarkup()
+    # Pass the message ID in the callback data so we know which message to edit
+    markup.add(telebot.types.InlineKeyboardButton("✅ Approve", callback_data=f"app|{user_id}|{msg_id}"))
+    markup.add(telebot.types.InlineKeyboardButton("❌ Deny", callback_data=f"den|{user_id}|{msg_id}"))
+    return markup
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_query(call):
+    action, user_id, msg_id = call.data.split('|')
+    data = load_json(FEEDBACK_DB_PATH, {})
+    
+    if action == "app":
+        # 1. Edit the group message
+        bot.edit_message_text(f"✅ <b>USER:</b> {user_id}\nStatus: <b>Approved</b>", FREE_GROUP_ID, int(msg_id), parse_mode="HTML")
+        # 2. DM the user
+        try: bot.send_message(user_id, "✅ Your attack feedback has been approved. You can now attack using /faaa!")
+        except: pass
+        if user_id in data: del data[user_id]
+        bot.answer_callback_query(call.id, "Approved!")
+        
+    elif action == "den":
+        bot.edit_message_text(f"❌ <b>USER:</b> {user_id}\nStatus: <b>Rejected</b>", FREE_GROUP_ID, int(msg_id), parse_mode="HTML")
+        try: bot.send_message(user_id, "❌ Your feedback was rejected. Please send the correct screenshot.")
+        except: pass
+        if user_id in data: del data[user_id]
+        bot.answer_callback_query(call.id, "Rejected!")
+        
+    save_json(FEEDBACK_DB_PATH, data)
+    
+if __name__ == "__main__":
+    print("🚀 Feedback Bot is running...")
+    
+    # 1. Start the auto-approval loop in a background thread
+    auto_approval_thread = threading.Thread(target=check_auto_approval, daemon=True)
+    auto_approval_thread.start()
+    
+    # 2. Start the bot polling
+    bot.infinity_polling(timeout=60, long_polling_timeout=60)

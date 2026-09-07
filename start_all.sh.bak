@@ -1,0 +1,27 @@
+#!/bin/bash
+
+# Path to your virtual environment and bot folder
+VENV_PATH="/home/dx2/myenv/bin/activate"
+BOT_DIR="/home/dx2"
+
+# Function to start a bot in a new tmux window
+start_bot() {
+    local session_name=$1
+    local script_name=$2
+    
+    echo "🚀 Starting $session_name..."
+    tmux new-session -d -s "$session_name"
+    tmux send-keys -t "$session_name" "source $VENV_PATH" C-m
+    tmux send-keys -t "$session_name" "cd $BOT_DIR" C-m
+    tmux send-keys -t "$session_name" "python3 $script_name" C-m
+}
+
+# Start all your scripts
+start_bot "FreeBot" "free6.py"
+start_bot "PaidBot" "paid11.py"
+start_bot "IdBot" "id_bot.py"
+start_bot "SubmitBot" "submit_link.py"
+start_bot "ScheduleBot" "schedule_messages2.py"
+
+echo "✅ All bots are running in tmux sessions!"
+echo "Use 'tmux ls' to see them or 'tmux attach -t FreeBot' to view one."
